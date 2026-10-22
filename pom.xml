@@ -21,7 +21,7 @@
         <mvnGroupPath>org/lucee</mvnGroupPath>
         <mvnArtifactId>http</mvnArtifactId>
         <filename>http-extension</filename>
-        <luceeCoreVersion>9.0.0.4-ALPHA</luceeCoreVersion>
+        <luceeCoreVersion>9.0.0.279-ALPHA</luceeCoreVersion>
         <releaseType>server</releaseType>
         <label>HTTP Extension</label>
         <class>org.lucee.extension.http.HC5Engine</class>
