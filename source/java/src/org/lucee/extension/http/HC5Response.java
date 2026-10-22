@@ -1,8 +1,10 @@
 package org.lucee.extension.http;
 
+import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.Charset;
@@ -70,25 +72,31 @@ final class HC5Response implements HTTPResponse {
 	private final ClassicHttpResponse rsp;
 	private final CloseableHttpClient client;
 	private final URL url;
-	private final URI target;
+	private final URL target;
 	private final List<URI> locations;
 	private final Header[] headers;
+	// the content, when it had to be read to get its length
+	private byte[] buffered;
 	private boolean closed;
 
 	/**
 	 * @param client the client to close when the response is closed, null when the client is shared
+	 * @param url the URL of the request
+	 * @param target the URL of the response, after the redirects
+	 * @param locations the URLs of the redirects that were followed
 	 */
-	HC5Response(ClassicHttpResponse rsp, CloseableHttpClient client, URL url, URI target, List<URI> locations) {
+	HC5Response(ClassicHttpResponse rsp, CloseableHttpClient client, URL url, URI target, List<URI> locations) throws MalformedURLException {
 		this.rsp = rsp;
 		this.client = client;
 		this.url = url;
-		this.target = target;
+		this.target = target.toURL();
 		this.locations = locations;
 
-		// HttpClient decompresses the content (gzip, deflate), the headers that described the compressed content are removed, like HttpClient 4 did
-		org.apache.hc.core5.http.Header ce = rsp.getFirstHeader("Content-Encoding");
-		String enc = ce == null || ce.getValue() == null ? "" : ce.getValue().toLowerCase();
-		boolean decoded = enc.contains("gzip") || enc.contains("deflate");
+		// HttpClient decompresses the content (gzip, deflate, ...) and replaces the entity with one that has no
+		// content encoding anymore, only then the headers that describe the compressed content are removed (like
+		// HttpClient 4 did). A response without content (HEAD, 204, 304) is not decompressed, its headers stay.
+		HttpEntity entity = rsp.getEntity();
+		boolean decoded = rsp.containsHeader("Content-Encoding") && entity != null && entity.getContentEncoding() == null;
 
 		org.apache.hc.core5.http.Header[] src = rsp.getHeaders();
 		List<Header> list = new java.util.ArrayList<>();
@@ -115,6 +123,7 @@ final class HC5Response implements HTTPResponse {
 
 	@Override
 	public InputStream getContentAsStream() throws IOException {
+		if (buffered != null) return new ByteArrayInputStream(buffered);
 		HttpEntity e = rsp.getEntity();
 		if (e == null) return null;
 		// closing the stream releases the connection and closes a client of its own
@@ -133,11 +142,13 @@ final class HC5Response implements HTTPResponse {
 
 	@Override
 	public byte[] getContentAsByteArray() throws IOException {
+		if (buffered != null) return buffered;
 		HttpEntity e = rsp.getEntity();
 		if (e == null) return new byte[0];
 		try (InputStream is = e.getContent()) {
-			return is.readAllBytes();
+			buffered = is.readAllBytes();
 		}
+		return buffered;
 	}
 
 	@Override
@@ -193,26 +204,29 @@ final class HC5Response implements HTTPResponse {
 	@Override
 	public long getContentLength() throws IOException {
 		Header h = getLastHeaderIgnoreCase("Content-Length");
-		if (h != null) {
-			try {
-				return Long.parseLong(h.getValue().trim());
-			}
-			catch (NumberFormatException e) {
-			}
-		}
+		// an invalid header is an unknown length, like the built-in engine
+		if (h != null) return toLong(h.getValue(), -1);
+		if (buffered != null) return buffered.length;
 		HttpEntity e = rsp.getEntity();
 		if (e == null) return 0;
 		long length = e.getContentLength();
 		if (length >= 0) return length;
+		// the length is only known after reading the content, it is kept, so it can still be read afterwards
 		try (InputStream is = e.getContent()) {
-			long count = 0;
-			byte[] buffer = new byte[1024];
-			int len;
-			while ((len = is.read(buffer)) != -1) {
-				count += len;
-			}
-			return count;
+			buffered = is.readAllBytes();
 		}
+		return buffered.length;
+	}
+
+	private static long toLong(String value, long defaultValue) {
+		if (value == null) return defaultValue;
+		String str = value.trim();
+		if (str.isEmpty()) return defaultValue;
+		for (int i = 0; i < str.length(); i++) {
+			if (!Character.isDigit(str.charAt(i))) return defaultValue;
+		}
+		if (str.length() > 18) return defaultValue;
+		return Long.parseLong(str);
 	}
 
 	@Override
@@ -222,12 +236,7 @@ final class HC5Response implements HTTPResponse {
 
 	@Override
 	public URL getTargetURL() {
-		try {
-			return target.toURL();
-		}
-		catch (Exception e) {
-			return url;
-		}
+		return target;
 	}
 
 	@Override
