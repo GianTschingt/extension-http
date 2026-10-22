@@ -4,23 +4,34 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLContext;
 
 import org.apache.hc.client5.http.HttpRoute;
+import org.apache.hc.client5.http.auth.AuthSchemeFactory;
 import org.apache.hc.client5.http.auth.AuthScope;
-import org.apache.hc.client5.http.auth.NTCredentials;
+import org.apache.hc.client5.http.auth.StandardAuthScheme;
 import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.cookie.BasicCookieStore;
 import org.apache.hc.client5.http.cookie.StandardCookieSpec;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.AbstractContentBody;
@@ -31,30 +42,37 @@ import org.apache.hc.client5.http.entity.mime.StringBody;
 import org.apache.hc.client5.http.impl.auth.BasicAuthCache;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.auth.BasicScheme;
+import org.apache.hc.client5.http.impl.auth.BasicSchemeFactory;
+import org.apache.hc.client5.http.impl.auth.DigestSchemeFactory;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
-import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
 import org.apache.hc.client5.http.impl.cookie.BasicClientCookie;
-import org.apache.hc.client5.http.cookie.BasicCookieStore;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
-import org.apache.hc.client5.http.protocol.RedirectLocations;
 import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
+import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
-import org.apache.hc.client5.http.ssl.TrustAllStrategy;
+import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpResponse;
+import org.apache.hc.core5.http.Method;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.NoHttpResponseException;
+import org.apache.hc.core5.http.config.Lookup;
+import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.http.io.SocketConfig;
+import org.apache.hc.core5.http.io.entity.AbstractHttpEntity;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.http.io.entity.InputStreamEntity;
 import org.apache.hc.core5.http.io.entity.StringEntity;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.hc.core5.http.protocol.HttpContext;
+import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.pool.PoolStats;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
@@ -71,7 +89,12 @@ import lucee.runtime.type.Struct;
 
 /**
  * The full featured HTTP engine for Lucee, based on Apache HttpClient 5. It replaces the built-in
- * engine (java.net.http) of the Lucee core.
+ * engine (java.net.http) of the Lucee core and does what the built-in engine rejects: NTLM, Digest and
+ * the other authentication schemes of HttpClient, the headers the JDK client does not allow to set
+ * (Host, Connection, Expect, Upgrade) and Basic authentication at a proxy for HTTPS (CONNECT).
+ *
+ * Redirects, credentials on redirects, the TLS settings and the proxy are handled like the built-in
+ * engine does, so a request behaves the same with both engines.
  */
 public final class HC5Engine implements HTTPClientEngine {
 
@@ -79,11 +102,44 @@ public final class HC5Engine implements HTTPClientEngine {
 	private static final int POOL_MAX_CONN_PER_ROUTE = 100;
 	private static final long POOL_CONN_TTL_MS = 15000;
 	private static final long POOL_CONN_INACTIVITY_MS = 2000;
+	// connection pools (one per TLS configuration) that are kept, the least recently used one is retired
+	// when there are more
+	private static final int MAX_POOLS = 64;
+	// like the built-in engine
+	private static final int MAX_REDIRECTS = 50;
 
-	// one connection manager (pool) per TLS configuration
-	private final Map<String, PoolingHttpClientConnectionManager> managers = new ConcurrentHashMap<>();
-	private volatile CloseableHttpClient sharedClient;
-	private volatile PoolingHttpClientConnectionManager sharedManager;
+	private static final List<String> FEATURES = Collections.unmodifiableList(Arrays.asList(FEATURE_NTLM, FEATURE_PREEMPTIVE_AUTH, FEATURE_RESTRICTED_HEADERS,
+			FEATURE_TLS_OPTIONS, FEATURE_POOL));
+
+	private static final List<String> SCHEMES_NTLM = Collections.singletonList(StandardAuthScheme.NTLM);
+	private static final List<String> SCHEMES_DEFAULT = Collections.unmodifiableList(Arrays.asList(StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC));
+
+	@SuppressWarnings("deprecation")
+	private static final Lookup<AuthSchemeFactory> AUTH_SCHEMES = RegistryBuilder.<AuthSchemeFactory>create().register(StandardAuthScheme.BASIC, BasicSchemeFactory.INSTANCE)
+			.register(StandardAuthScheme.DIGEST, DigestSchemeFactory.INSTANCE)
+			.register(StandardAuthScheme.NTLM, org.apache.hc.client5.http.impl.auth.NTLMSchemeFactory.INSTANCE).build();
+
+	/**
+	 * a connection pool and the client that uses it, the client has no state of a request (cookies,
+	 * credentials, proxy, redirects and time-outs are set per request)
+	 */
+	private static final class Pool {
+		final PoolingHttpClientConnectionManager manager;
+		final CloseableHttpClient client;
+
+		Pool(PoolingHttpClientConnectionManager manager, CloseableHttpClient client) {
+			this.manager = manager;
+			this.client = client;
+		}
+	}
+
+	// all access to pools and retired is synchronized on lock
+	private final Object lock = new Object();
+	// key: hash of the TLS configuration (it contains passwords, so only the hash is kept), access order
+	// for the LRU
+	private final LinkedHashMap<String, Pool> pools = new LinkedHashMap<>(16, 0.75f, true);
+	// pools that are no longer used for new requests, they are closed as soon as no connection is leased
+	private final List<Pool> retired = new ArrayList<>();
 
 	@Override
 	public void init(Config config) throws PageException {
@@ -96,33 +152,60 @@ public final class HC5Engine implements HTTPClientEngine {
 
 	@Override
 	public boolean supports(String feature) {
-		return true;
+		return feature != null && FEATURES.contains(feature.trim().toLowerCase(Locale.ROOT));
 	}
 
 	// ------------------------------------------------------------------------------------------
 	// pool and client
 	// ------------------------------------------------------------------------------------------
 
-	private PoolingHttpClientConnectionManager manager(HTTPRequest r, boolean pooled) throws IOException {
-		String key = r.getClientCert() + ":" + r.getClientCertPassword() + ":" + r.getTrustStore() + ":" + r.getTrustStorePassword() + ":" + r.isSslVerify();
-		if (pooled) {
-			PoolingHttpClientConnectionManager cm = managers.get(key);
-			if (cm == null) {
-				synchronized (managers) {
-					cm = managers.get(key);
-					if (cm == null) {
-						cm = createManager(r, POOL_MAX_CONN, POOL_MAX_CONN_PER_ROUTE);
-						managers.put(key, cm);
-					}
-				}
+	private Pool pool(HTTPRequest r) throws IOException {
+		String key = poolKey(r);
+		synchronized (lock) {
+			Pool p = pools.get(key);
+			if (p != null) return p;
+			p = createPool(r, POOL_MAX_CONN, POOL_MAX_CONN_PER_ROUTE);
+			pools.put(key, p);
+			if (pools.size() > MAX_POOLS) {
+				Iterator<Pool> it = pools.values().iterator();
+				retired.add(it.next());
+				it.remove();
+				closeRetired();
 			}
-			return cm;
+			return p;
 		}
-		// not pooled: a connection manager for this request only
-		return createManager(r, 1, 1);
 	}
 
-	private PoolingHttpClientConnectionManager createManager(HTTPRequest r, int maxTotal, int maxPerRoute) throws IOException {
+	private static String poolKey(HTTPRequest r) throws IOException {
+		StringBuilder sb = new StringBuilder();
+		append(sb, r.getClientCert());
+		append(sb, r.getClientCertPassword());
+		append(sb, r.getTrustStore());
+		append(sb, r.getTrustStorePassword());
+		sb.append(r.isSslVerify());
+		try {
+			byte[] hash = MessageDigest.getInstance("SHA-256").digest(sb.toString().getBytes(StandardCharsets.UTF_8));
+			StringBuilder hex = new StringBuilder();
+			for (byte b: hash) {
+				hex.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+			}
+			return hex.toString();
+		}
+		catch (NoSuchAlgorithmException e) {
+			throw Util.engine().getExceptionUtil().toIOException(e);
+		}
+	}
+
+	private static void append(StringBuilder sb, String value) {
+		// with the length, so the values can not be shifted from one into the other
+		if (value == null) sb.append("-1:");
+		else sb.append(value.length()).append(':').append(value);
+		sb.append('|');
+	}
+
+	private static Pool createPool(HTTPRequest r, int maxTotal, int maxPerRoute) throws IOException {
+		// the same SSL context as the built-in engine: the trust store of the JVM, the custom cacerts of Lucee
+		// (SSLCertificateInstall) and the trustStore of the request, or no verification at all
 		SSLContext ctx;
 		try {
 			ctx = Util.engine().getHTTPUtil().createSSLContext(r.getClientCert(), r.getClientCertPassword(), r.getTrustStore(), r.getTrustStorePassword(), r.isSslVerify());
@@ -132,37 +215,36 @@ public final class HC5Engine implements HTTPClientEngine {
 		}
 		// with the built-in policy the JDK verifies the host name and a verifier is not asked, so for no verification the verifier decides
 		DefaultClientTlsStrategy tls = r.isSslVerify() ? new DefaultClientTlsStrategy(ctx)
-				: new DefaultClientTlsStrategy(ctx, org.apache.hc.client5.http.ssl.HostnameVerificationPolicy.CLIENT, NoopHostnameVerifier.INSTANCE);
+				: new DefaultClientTlsStrategy(ctx, HostnameVerificationPolicy.CLIENT, NoopHostnameVerifier.INSTANCE);
 
-		return PoolingHttpClientConnectionManagerBuilder.create().setTlsSocketStrategy(tls).setMaxConnTotal(maxTotal).setMaxConnPerRoute(maxPerRoute)
-				.setDefaultSocketConfig(SocketConfig.custom().setTcpNoDelay(true).setSoReuseAddress(true).build())
+		PoolingHttpClientConnectionManager cm = PoolingHttpClientConnectionManagerBuilder.create().setTlsSocketStrategy(tls).setMaxConnTotal(maxTotal)
+				.setMaxConnPerRoute(maxPerRoute).setDefaultSocketConfig(SocketConfig.custom().setTcpNoDelay(true).setSoReuseAddress(true).build())
 				.setDefaultConnectionConfig(ConnectionConfig.custom().setTimeToLive(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS))
 						.setValidateAfterInactivity(TimeValue.ofMilliseconds(POOL_CONN_INACTIVITY_MS)).build())
 				.build();
+
+		// no thread of its own that evicts idle connections, the core calls closeIdleConnections() regularly.
+		// The redirects are followed by the engine itself (see execute), like the built-in engine does.
+		CloseableHttpClient client = HttpClientBuilder.create().setConnectionManager(cm).disableRedirectHandling().setRetryStrategy(new RetryStrategy())
+				.setDefaultAuthSchemeRegistry(AUTH_SCHEMES).build();
+		return new Pool(cm, client);
 	}
 
-	private HttpClientBuilder builder(PoolingHttpClientConnectionManager cm, boolean shared, String redirect) {
-		HttpClientBuilder b = HttpClientBuilder.create().setConnectionManager(cm).setConnectionManagerShared(shared).setRetryStrategy(new RetryStrategy());
-		if (shared) b.evictIdleConnections(TimeValue.ofSeconds(30)).evictExpiredConnections();
-
-		boolean lax = "lax".equalsIgnoreCase(redirect);
-		b.setRedirectStrategy(new RedirectStrategy(lax));
-		return b;
-	}
-
-	private CloseableHttpClient sharedClient() throws IOException {
-		CloseableHttpClient c = sharedClient;
-		if (c == null) {
-			synchronized (managers) {
-				c = sharedClient;
-				if (c == null) {
-					HTTPRequest def = new HTTPRequest();
-					sharedManager = manager(def, true);
-					sharedClient = c = builder(sharedManager, true, "true").build();
-				}
+	/**
+	 * closes the retired pools that have no leased connection anymore, the other ones only close their
+	 * idle connections, must be called with the lock
+	 */
+	private void closeRetired() {
+		Iterator<Pool> it = retired.iterator();
+		while (it.hasNext()) {
+			Pool p = it.next();
+			p.manager.closeIdle(TimeValue.ZERO_MILLISECONDS);
+			PoolStats stats = p.manager.getTotalStats();
+			if (stats.getLeased() == 0 && stats.getPending() == 0) {
+				p.manager.close(CloseMode.GRACEFUL);
+				it.remove();
 			}
 		}
-		return c;
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -173,107 +255,204 @@ public final class HC5Engine implements HTTPClientEngine {
 	public HTTPResponse execute(HTTPRequest r) throws IOException {
 		r.validate();
 		URL url = r.getURL();
-		HttpUriRequestBase req = createRequest(r);
+		URI uri = toURI(url);
 
-		boolean redirectEnabled = Util.toBooleanValue(r.getRedirect(), true);
-		RequestConfig.Builder rc = RequestConfig.custom().setCookieSpec(StandardCookieSpec.RELAXED).setRedirectsEnabled(redirectEnabled);
+		String redirect = r.getRedirect() == null ? "true" : r.getRedirect().trim();
+		boolean follow = !"false".equalsIgnoreCase(redirect);
+		// like the built-in engine: without pooling Apache HttpClient always followed redirects the lax way
+		// (LaxRedirectStrategy), that stays (LDEV-6675)
+		boolean lax = "lax".equalsIgnoreCase(redirect) || (follow && !r.isPooling());
+
+		RequestConfig.Builder rc = RequestConfig.custom().setCookieSpec(StandardCookieSpec.RELAXED).setRedirectsEnabled(false);
 		if (r.getConnectTimeout() >= 0) rc.setConnectTimeout(Timeout.ofMilliseconds(r.getConnectTimeout()));
 		if (r.getConnectionRequestTimeout() >= 0) rc.setConnectionRequestTimeout(Timeout.ofMilliseconds(r.getConnectionRequestTimeout()));
 		if (r.getReadTimeout() >= 0) rc.setResponseTimeout(Timeout.ofMilliseconds(r.getReadTimeout()));
 
-		ProxyData proxy = r.getProxy();
-		boolean hasProxy = proxy != null && !Util.isEmpty(proxy.getServer(), true);
-		HttpHost target = new HttpHost(url.getProtocol(), url.getHost(), url.getPort());
-
-		boolean tls = !Util.isEmpty(r.getClientCert(), true) || !Util.isEmpty(r.getTrustStore(), true) || !r.isSslVerify();
-		boolean ntlm = !Util.isEmpty(r.getUsername(), true) && r.getAuthType() == HTTPRequest.AUTH_NTLM;
-		boolean dedicated = !r.isPooling() || tls || ntlm || !r.getCookies().isEmpty() || "lax".equalsIgnoreCase(r.getRedirect());
-
 		HttpClientContext context = HttpClientContext.create();
+
+		// cookies of the request, without a domain they are for the host of the URL (a cookie without a
+		// domain is never sent by HttpClient)
 		BasicCookieStore cookieStore = new BasicCookieStore();
-		String cs = Util.isEmpty(r.getCharset(), true) ? "UTF-8" : r.getCharset();
+		Charset cs = Util.toCharset(r.getCharset(), StandardCharsets.UTF_8);
 		for (HTTPRequest.Cookie c: r.getCookies()) {
 			BasicClientCookie cookie = new BasicClientCookie(encode(c.getName(), cs), encode(c.getValue(), cs));
-			if (!Util.isEmpty(c.getDomain(), true)) cookie.setDomain(c.getDomain());
-			if (!Util.isEmpty(c.getPath(), true)) cookie.setPath(c.getPath());
+			cookie.setDomain(Util.isEmpty(c.getDomain(), true) ? url.getHost() : c.getDomain().trim());
+			cookie.setPath(Util.isEmpty(c.getPath(), true) ? "/" : c.getPath().trim());
 			cookieStore.addCookie(cookie);
 		}
 		context.setCookieStore(cookieStore);
 
-		BasicCredentialsProvider credsProvider = null;
+		// credentials, only for the host of the URL, a redirect to another host does not get them (like
+		// the built-in engine)
+		BasicCredentialsProvider credsProvider = new BasicCredentialsProvider();
+		boolean ntlm = false;
 		if (!Util.isEmpty(r.getUsername(), true)) {
-			credsProvider = new BasicCredentialsProvider();
 			char[] pw = (r.getPassword() == null ? "" : r.getPassword()).toCharArray();
-			if (ntlm) {
-				credsProvider.setCredentials(new AuthScope(null, -1), new NTCredentials(r.getUsername(), pw, r.getWorkStation(), r.getDomain()));
+			AuthScope scope = new AuthScope(url.getHost(), -1);
+			if (r.getAuthType() == HTTPRequest.AUTH_NTLM) {
+				ntlm = true;
+				credsProvider.setCredentials(scope, ntCredentials(r, pw));
 			}
 			else {
 				UsernamePasswordCredentials creds = new UsernamePasswordCredentials(r.getUsername(), pw);
-				credsProvider.setCredentials(new AuthScope(null, -1), creds);
+				credsProvider.setCredentials(scope, creds);
 				if (r.isPreAuth()) {
 					BasicScheme scheme = new BasicScheme();
 					scheme.initPreemptive(creds);
 					BasicAuthCache authCache = new BasicAuthCache();
-					authCache.put(target, scheme);
+					authCache.put(new HttpHost(uri.getScheme(), uri.getHost(), uri.getPort()), scheme);
 					context.setAuthCache(authCache);
 				}
 			}
 		}
-		if (hasProxy) {
-			rc.setProxy(new HttpHost(proxy.getServer(), proxy.getPort() == -1 ? 80 : proxy.getPort()));
-			if (!Util.isEmpty(proxy.getUsername())) {
-				if (credsProvider == null) credsProvider = new BasicCredentialsProvider();
-				credsProvider.setCredentials(new AuthScope(proxy.getServer(), proxy.getPort()),
+		rc.setTargetPreferredAuthSchemes(ntlm ? SCHEMES_NTLM : SCHEMES_DEFAULT);
+		rc.setProxyPreferredAuthSchemes(SCHEMES_DEFAULT);
+
+		// proxy, without a proxy of the request there is none (no proxy system properties), like the built-in
+		// engine. The port is resolved once, so the proxy and the scope of its credentials match.
+		ProxyData proxy = r.getProxy();
+		if (proxy != null && !Util.isEmpty(proxy.getServer(), true)) {
+			String proxyServer = proxy.getServer().trim();
+			int proxyPort = proxy.getPort() <= 0 ? 80 : proxy.getPort();
+			rc.setProxy(new HttpHost(proxyServer, proxyPort));
+			if (!Util.isEmpty(proxy.getUsername(), true)) {
+				// for HTTPS HttpClient sends the credentials with the CONNECT of the tunnel after the proxy asked for them (407)
+				credsProvider.setCredentials(new AuthScope(proxyServer, proxyPort),
 						new UsernamePasswordCredentials(proxy.getUsername(), (proxy.getPassword() == null ? "" : proxy.getPassword()).toCharArray()));
 			}
 		}
-		if (credsProvider != null) context.setCredentialsProvider(credsProvider);
-		req.setConfig(rc.build());
+		context.setCredentialsProvider(credsProvider);
+		context.setRequestConfig(rc.build());
 
+		// a pooled request uses the client of its pool, a request without pooling gets a client and a
+		// connection of its own, they are closed with the response
 		CloseableHttpClient client;
-		boolean closeClient;
-		if (dedicated) {
-			PoolingHttpClientConnectionManager cm = manager(r, r.isPooling());
-			// the pool of a pooled manager is shared, closing the client does not close it
-			client = builder(cm, r.isPooling(), r.getRedirect()).build();
-			closeClient = true;
+		CloseableHttpClient ownClient = null;
+		if (r.isPooling()) {
+			client = pool(r).client;
 		}
 		else {
-			client = sharedClient();
-			closeClient = false;
+			client = ownClient = createPool(r, 1, 1).client;
 		}
 
-		r.setAbortHandler(req::cancel);
+		String method = r.getMethod();
+		HttpEntity entity = createEntity(r, method);
+		List<URI> locations = new ArrayList<>();
+		AtomicReference<HttpUriRequestBase> current = new AtomicReference<>();
+		r.setAbortHandler(() -> {
+			HttpUriRequestBase req = current.get();
+			if (req != null) req.cancel();
+		});
+
 		try {
-			ClassicHttpResponse rsp = client.executeOpen(null, req, context);
-			RedirectLocations rl = context.getRedirectLocations();
-			URI last = req.getUri();
-			return new HC5Response(rsp, closeClient ? client : null, url, last, rl == null ? null : rl.getAll());
-		}
-		catch (org.apache.hc.client5.http.ConnectTimeoutException e) {
-			if (closeClient) client.close();
-			// the tag reports a SocketTimeoutException as a request time-out, a connect time-out is a connection failure (HttpClient 4 had a different type)
-			java.io.InterruptedIOException ioe = new java.io.InterruptedIOException(e.getMessage());
-			ioe.initCause(e);
-			throw ioe;
+			int redirects = 0;
+			while (true) {
+				HttpUriRequestBase req = createRequest(r, method, uri, entity);
+				current.set(req);
+				if (r.isAborted()) req.cancel();
+
+				ClassicHttpResponse rsp;
+				try {
+					rsp = client.executeOpen(null, req, context);
+				}
+				catch (org.apache.hc.client5.http.ConnectTimeoutException e) {
+					// a connect time-out is a connection failure, not a time-out of the request (408), like with the
+					// built-in engine, so it must not be a SocketTimeoutException
+					java.net.ConnectException ce = new java.net.ConnectException(e.getMessage());
+					ce.initCause(e);
+					throw ce;
+				}
+				int status = rsp.getCode();
+				org.apache.hc.core5.http.Header loc = rsp.getFirstHeader("Location");
+				String location = loc == null ? null : loc.getValue();
+
+				if (follow && location != null && isRedirect(status) && mayFollow(status, method, lax)) {
+					// read the rest of the response, so the connection can be used again
+					try {
+						EntityUtils.consume(rsp.getEntity());
+					}
+					finally {
+						rsp.close();
+					}
+					if (++redirects > MAX_REDIRECTS) throw new IOException("Maximum redirects (" + MAX_REDIRECTS + ") exceeded");
+					URI next = resolve(uri, location);
+					locations.add(next);
+					// 301, 302 and 303 turn the request into a GET without a body, 307 and 308 keep the method and the body
+					if (status == 301 || status == 302 || status == 303) {
+						if (!"HEAD".equals(method) && !"GET".equals(method)) {
+							method = "GET";
+							entity = null;
+						}
+					}
+					else if (entity != null && !entity.isRepeatable()) {
+						throw new IOException("the redirect [" + status + "] to [" + next + "] needs the body of the request a second time, but the body is a stream that can only be read once");
+					}
+					uri = next;
+					continue;
+				}
+				try {
+					return new HC5Response(rsp, ownClient, url, uri, locations);
+				}
+				catch (IOException | RuntimeException e) {
+					rsp.close();
+					throw e;
+				}
+			}
 		}
 		catch (IOException | RuntimeException e) {
-			if (closeClient) client.close();
+			if (ownClient != null) ownClient.close();
 			throw e;
-		}
-		catch (Exception e) {
-			if (closeClient) client.close();
-			throw Util.engine().getExceptionUtil().toIOException(e);
 		}
 	}
 
-	private static String encode(String str, String charset) {
-		if (str == null) return "";
+	@SuppressWarnings("deprecation")
+	private static org.apache.hc.client5.http.auth.Credentials ntCredentials(HTTPRequest r, char[] pw) {
+		return new org.apache.hc.client5.http.auth.NTCredentials(r.getUsername(), pw, r.getWorkStation(), r.getDomain());
+	}
+
+	private static boolean isRedirect(int status) {
+		return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+	}
+
+	// like the built-in engine and the redirect strategies of Apache HttpClient: a 303 always, otherwise GET and
+	// HEAD, lax also POST and DELETE
+	private static boolean mayFollow(int status, String method, boolean lax) {
+		if (status == 303) return true;
+		if ("GET".equals(method) || "HEAD".equals(method)) return true;
+		return lax && ("POST".equals(method) || "DELETE".equals(method));
+	}
+
+	private static URI toURI(URL url) throws IOException {
 		try {
-			if (needsEncoding(str)) return java.net.URLEncoder.encode(str, charset);
+			return url.toURI();
 		}
-		catch (Exception e) {
+		catch (URISyntaxException e) {
+			try {
+				return URI.create(url.toExternalForm());
+			}
+			catch (IllegalArgumentException iae) {
+				throw new IOException("invalid URL [" + url + "]: " + e.getMessage(), e);
+			}
 		}
+	}
+
+	private static URI resolve(URI base, String location) throws IOException {
+		URI next;
+		try {
+			next = base.resolve(location.trim());
+		}
+		catch (IllegalArgumentException e) {
+			throw new IOException("invalid redirect location [" + location + "]: " + e.getMessage(), e);
+		}
+		if (next.getHost() == null || !("http".equalsIgnoreCase(next.getScheme()) || "https".equalsIgnoreCase(next.getScheme()))) {
+			throw new IOException("invalid redirect location [" + location + "]");
+		}
+		return next;
+	}
+
+	private static String encode(String str, Charset charset) {
+		if (str == null) return "";
+		if (needsEncoding(str)) return java.net.URLEncoder.encode(str, charset);
 		return str;
 	}
 
@@ -285,28 +464,24 @@ public final class HC5Engine implements HTTPClientEngine {
 		return false;
 	}
 
-	private static HttpUriRequestBase createRequest(HTTPRequest r) throws IOException {
-		String method = r.getMethod();
-		// the methods the tag knows are sent with their name, the other ones as POST
-		String m = HTTPRequest.GET.equals(method) || HTTPRequest.HEAD.equals(method) || HTTPRequest.DELETE.equals(method) || HTTPRequest.PUT.equals(method)
-				|| HTTPRequest.TRACE.equals(method) || HTTPRequest.OPTIONS.equals(method) || HTTPRequest.PATCH.equals(method) ? method : HTTPRequest.POST;
-		HttpUriRequestBase req = new HttpUriRequestBase(m, URI.create(r.getURL().toExternalForm()));
-
+	private static HttpUriRequestBase createRequest(HTTPRequest r, String method, URI uri, HttpEntity entity) {
+		HttpUriRequestBase req = new HttpUriRequestBase(method, uri);
 		for (Header h: r.getHeaders()) {
+			// the length comes from the body, HttpClient fails when the header is already set
+			if ("content-length".equalsIgnoreCase(h.getName())) continue;
+			// Host, Connection, Expect and Upgrade are sent like they are set, HttpClient only sets them when they are missing
 			req.addHeader(h.getName(), h.getValue());
 		}
-
-		boolean hasBody = r.getBody() != null || r.getFormFields() != null || r.getParts() != null;
-		if (hasBody) {
-			if (HTTPRequest.HEAD.equals(m) || HTTPRequest.TRACE.equals(m) || HTTPRequest.OPTIONS.equals(m)) {
-				throw new IOException("the method [" + m.toLowerCase() + "] does not support a body");
-			}
-			req.setEntity(createEntity(r));
-		}
+		if (entity != null) req.setEntity(entity);
 		return req;
 	}
 
-	private static HttpEntity createEntity(HTTPRequest r) throws IOException {
+	private static HttpEntity createEntity(HTTPRequest r, String method) throws IOException {
+		boolean hasBody = r.getBody() != null || r.getFormFields() != null || r.getParts() != null;
+		if (!hasBody) return null;
+		if (HTTPRequest.HEAD.equals(method) || HTTPRequest.TRACE.equals(method) || HTTPRequest.OPTIONS.equals(method)) {
+			throw new IOException("the method [" + method.toLowerCase(Locale.ROOT) + "] does not support a body");
+		}
 		String charset = r.getCharset();
 
 		// multipart
@@ -348,24 +523,11 @@ public final class HC5Engine implements HTTPClientEngine {
 
 		try {
 			if (value instanceof HttpEntity) return (HttpEntity) value;
-			if (value instanceof InputStream) return new ByteArrayEntity(((InputStream) value).readAllBytes(), ct);
-			if (value instanceof Resource) {
-				Resource res = (Resource) value;
-				try (InputStream is = res.getInputStream()) {
-					return new ByteArrayEntity(is.readAllBytes(), ct);
-				}
-			}
-			// a stream that was filled by the caller (TemporaryStream of the core)
-			try {
-				java.lang.reflect.Method m = value.getClass().getMethod("getInputStream");
-				if (InputStream.class.isAssignableFrom(m.getReturnType())) {
-					try (InputStream is = (InputStream) m.invoke(value)) {
-						return new ByteArrayEntity(is.readAllBytes(), ct);
-					}
-				}
-			}
-			catch (NoSuchMethodException e) {
-			}
+			// streams are sent as they are read, they are not loaded into the memory first
+			if (value instanceof InputStream) return new InputStreamEntity((InputStream) value, -1, ct);
+			if (value instanceof Resource) return new ResourceEntity((Resource) value, ct);
+			HttpEntity temp = temporaryStreamEntity(value, ct);
+			if (temp != null) return temp;
 			if (Util.engine().getDecisionUtil().isCastableToBinary(value, false)) return new ByteArrayEntity(Util.cast().toBinary(value), ct);
 
 			boolean wasNull = false;
@@ -383,6 +545,64 @@ public final class HC5Engine implements HTTPClientEngine {
 		}
 		catch (Exception e) {
 			throw Util.engine().getExceptionUtil().toIOException(e);
+		}
+	}
+
+	/**
+	 * the TemporaryStream of the core (a body the caller has written, in memory or in a file), it is not
+	 * part of the loader, so it is recognized by its class name. The stream is sent as it is read, with
+	 * its length.
+	 */
+	private static HttpEntity temporaryStreamEntity(Object value, ContentType ct) throws IOException {
+		if (!"lucee.commons.io.TemporaryStream".equals(value.getClass().getName())) return null;
+		try {
+			InputStream is = (InputStream) value.getClass().getMethod("getInputStream").invoke(value);
+			long length = ((Number) value.getClass().getMethod("length").invoke(value)).longValue();
+			return new InputStreamEntity(is, length, ct);
+		}
+		catch (java.lang.reflect.InvocationTargetException e) {
+			Throwable t = e.getCause();
+			if (t instanceof IOException) throw (IOException) t;
+			throw Util.engine().getExceptionUtil().toIOException(t);
+		}
+		catch (ReflectiveOperationException e) {
+			throw Util.engine().getExceptionUtil().toIOException(e);
+		}
+	}
+
+	/**
+	 * a resource as body, sent as it is read, with its length, it can be sent again (redirect 307/308)
+	 */
+	private static final class ResourceEntity extends AbstractHttpEntity {
+		private final Resource res;
+
+		ResourceEntity(Resource res, ContentType ct) {
+			super(ct, null);
+			this.res = res;
+		}
+
+		@Override
+		public boolean isRepeatable() {
+			return true;
+		}
+
+		@Override
+		public long getContentLength() {
+			return res.length();
+		}
+
+		@Override
+		public InputStream getContent() throws IOException {
+			return res.getInputStream();
+		}
+
+		@Override
+		public boolean isStreaming() {
+			return false;
+		}
+
+		@Override
+		public void close() {
 		}
 	}
 
@@ -421,34 +641,14 @@ public final class HC5Engine implements HTTPClientEngine {
 	// ------------------------------------------------------------------------------------------
 
 	/**
-	 * redirects: GET and HEAD follow redirects, other methods only follow a 303 (See Other), "lax" follows
-	 * the redirects of every method
-	 */
-	private static final class RedirectStrategy extends org.apache.hc.client5.http.impl.DefaultRedirectStrategy {
-		private final boolean lax;
-
-		RedirectStrategy(boolean lax) {
-			this.lax = lax;
-		}
-
-		@Override
-		public boolean isRedirected(HttpRequest request, HttpResponse response, HttpContext context) throws org.apache.hc.core5.http.ProtocolException {
-			if (!super.isRedirected(request, response, context)) return false;
-			if (lax) return true;
-			if (response.getCode() == 303) return true;
-			String m = request.getMethod();
-			return "GET".equalsIgnoreCase(m) || "HEAD".equalsIgnoreCase(m);
-		}
-	}
-
-	/**
-	 * a pooled connection that the server closed in the meantime is a transient condition, the request is
-	 * sent again, a status code is never a reason to send the request again
+	 * a pooled connection that the server closed in the meantime is a transient condition, an idempotent
+	 * request (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) is sent again, a POST or PATCH never (the server could
+	 * have processed it). A status code is never a reason to send the request again.
 	 */
 	private static final class RetryStrategy implements org.apache.hc.client5.http.HttpRequestRetryStrategy {
 		@Override
 		public boolean retryRequest(HttpRequest request, IOException exception, int execCount, HttpContext context) {
-			return execCount <= 2 && exception instanceof NoHttpResponseException;
+			return execCount <= 2 && exception instanceof NoHttpResponseException && Method.isIdempotent(request.getMethod());
 		}
 
 		@Override
@@ -466,36 +666,41 @@ public final class HC5Engine implements HTTPClientEngine {
 	// maintenance
 	// ------------------------------------------------------------------------------------------
 
+	/**
+	 * the core calls it after the trusted certificates changed (SSLCertificateInstall, SSLCertificateRemove,
+	 * Administrator), the next requests get new pools with a new SSL context, requests that are still
+	 * running complete on the old ones
+	 */
 	@Override
 	public void releaseConnections() {
-		List<PoolingHttpClientConnectionManager> old = new ArrayList<>(managers.values());
-		managers.clear();
-		CloseableHttpClient c = sharedClient;
-		sharedClient = null;
-		sharedManager = null;
-		for (PoolingHttpClientConnectionManager cm: old) {
-			cm.close();
-		}
-		if (c != null) {
-			try {
-				c.close();
-			}
-			catch (IOException e) {
-			}
+		synchronized (lock) {
+			retired.addAll(pools.values());
+			pools.clear();
+			closeRetired();
 		}
 	}
 
 	@Override
 	public void closeIdleConnections() {
-		for (PoolingHttpClientConnectionManager cm: managers.values()) {
-			cm.closeIdle(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS));
-			cm.closeExpired();
+		synchronized (lock) {
+			for (Pool p: pools.values()) {
+				p.manager.closeExpired();
+				p.manager.closeIdle(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS));
+			}
+			closeRetired();
 		}
 	}
 
 	@Override
 	public void close() {
-		releaseConnections();
+		synchronized (lock) {
+			retired.addAll(pools.values());
+			pools.clear();
+			for (Pool p: retired) {
+				p.manager.close(CloseMode.GRACEFUL);
+			}
+			retired.clear();
+		}
 	}
 
 	@Override
@@ -508,16 +713,30 @@ public final class HC5Engine implements HTTPClientEngine {
 		config.setEL("defaultMaxPerRoute", POOL_MAX_CONN_PER_ROUTE);
 		config.setEL("maxTotal", POOL_MAX_CONN);
 		config.setEL("validateAfterInactivity", POOL_CONN_INACTIVITY_MS);
+		config.setEL("maxPools", MAX_POOLS);
 		sct.setEL("config", config);
+		synchronized (lock) {
+			sct.setEL("pools", pools.size());
+			sct.setEL("retiredPools", retired.size());
+		}
 		return sct;
 	}
 
 	@Override
 	public Struct getPoolStats() {
+		List<PoolingHttpClientConnectionManager> managers = new ArrayList<>();
+		synchronized (lock) {
+			for (Pool p: pools.values()) {
+				managers.add(p.manager);
+			}
+			for (Pool p: retired) {
+				managers.add(p.manager);
+			}
+		}
 		Struct sct = Util.engine().getCreationUtil().createStruct();
 		Struct routes = Util.engine().getCreationUtil().createStruct();
 		int leased = 0, available = 0, pending = 0, max = 0;
-		for (PoolingHttpClientConnectionManager cm: managers.values()) {
+		for (PoolingHttpClientConnectionManager cm: managers) {
 			PoolStats totals = cm.getTotalStats();
 			leased += totals.getLeased();
 			available += totals.getAvailable();
