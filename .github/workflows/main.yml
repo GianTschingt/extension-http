@@ -7,6 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract-version.outputs.VERSION }}
+      lucee-versions: ${{ steps.lucee-versions.outputs.versions }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,6 +26,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
+      # the Lucee versions to test with come only from the variable LUCEE_TEST_VERSIONS_9 (organization or repository),
+      # there is no fallback version in this file, without the variable the build fails here with a clear message
+      - name: Lucee versions to test with
+        id: lucee-versions
+        env:
+          LUCEE_TEST_VERSIONS_9: ${{ vars.LUCEE_TEST_VERSIONS_9 }}
+        run: |
+          if [ -z "${LUCEE_TEST_VERSIONS_9}" ]; then
+            echo "::error::the variable LUCEE_TEST_VERSIONS_9 is not set, set it (organization or repository) to the Lucee versions to test with, e.g. [{\"version\":\"<Lucee 9 version>\",\"branch\":\"9.0\"}]"
+            exit 1
+          fi
+          if ! echo "${LUCEE_TEST_VERSIONS_9}" | jq -e 'type == "array" and length > 0 and all(.[]; (.version | type == "string" and length > 0) and (.branch | type == "string" and length > 0))' > /dev/null; then
+            echo "::error::the variable LUCEE_TEST_VERSIONS_9 must be a non empty JSON array of {\"version\":...,\"branch\":...}, it is: ${LUCEE_TEST_VERSIONS_9}"
+            exit 1
+          fi
+          echo "versions=$(echo "${LUCEE_TEST_VERSIONS_9}" | jq -c .)" >> "$GITHUB_OUTPUT"
+
       - name: Extract version number
         id: extract-version
         run: |
@@ -40,13 +58,16 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     needs: setup
-    env:
-      # TEMPORARY: hardcoded fallback so fork PRs (no repo vars) still run tests; remove once not needed
-      LUCEE_TEST_VERSIONS_9: ${{ vars.LUCEE_TEST_VERSIONS_9 || '[{"version":"9.0.0.21-ALPHA","branch":"9.0"}]' }}
     strategy:
+      fail-fast: false
       matrix:
-        # TEMPORARY: hardcoded fallback, see above
-        lucee: ${{ fromJSON(vars.LUCEE_TEST_VERSIONS_9 || '[{"version":"9.0.0.21-ALPHA","branch":"9.0"}]') }}
+        lucee: ${{ fromJSON(needs.setup.outputs.lucee-versions) }}
+    # the cfhttp tests of Lucee use httpbin, the same image the Lucee build uses
+    services:
+      httpbin:
+        image: ghcr.io/lucee/httpbin:test-mirror
+        ports:
+          - 8081:80
     steps:
       - uses: actions/checkout@v4
 
@@ -82,7 +103,7 @@ jobs:
           ref: ${{ matrix.lucee.branch }}
 
       # Lucee 9 alphas are not on update.lucee.org / the CDN, so fetch the light jar from Maven Central
-      # (version comes from the LUCEE_TEST_VERSIONS_9 matrix entry, e.g. "9.0.0.21-ALPHA")
+      # (the version comes from the LUCEE_TEST_VERSIONS_9 matrix entry)
       - name: Download Lucee light jar from Maven Central
         id: lucee-jar
         env:
@@ -94,7 +115,9 @@ jobs:
           curl -fsSL --retry 3 -o "${JAR}" "${URL}"
           echo "path=${JAR}" >> "$GITHUB_OUTPUT"
 
-      - name: Run Lucee Test Suite
+      # the cfhttp tests of Lucee (label http) and the tests of this extension (tests/) run with the extension installed,
+      # so every cfhttp call goes through the extension engine
+      - name: Run Lucee Test Suite (labels http, with the extension tests)
         uses: lucee/script-runner@main
         with:
           webroot: ${{ github.workspace }}/lucee/test
@@ -106,10 +129,27 @@ jobs:
           testLabels: http
           testAdditional: ${{ github.workspace }}/tests
           LUCEE_ADMIN_PASSWORD: admin
+          HTTPBIN_SERVER: localhost
+          HTTPBIN_PORT: 8081
+
+      # the cfhttp tests of Lucee labelled cfhttp and ssl (TLS options, client certificates, trust store)
+      - name: Run Lucee Test Suite (labels cfhttp, ssl)
+        uses: lucee/script-runner@main
+        with:
+          webroot: ${{ github.workspace }}/lucee/test
+          execute: /bootstrap-tests.cfm
+          luceeVersion: ${{ matrix.lucee.version }}
+          luceeJar: ${{ steps.lucee-jar.outputs.path }}
+          extensionDir: ${{ github.workspace }}/target
+        env:
+          testLabels: cfhttp,ssl
+          LUCEE_ADMIN_PASSWORD: admin
+          HTTPBIN_SERVER: localhost
+          HTTPBIN_PORT: 8081
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-and-test]
+    needs: [setup, build-and-test]
     # deploy only from pushes to the default branch, never for pull requests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build-and-test.result == 'success'
     steps:
