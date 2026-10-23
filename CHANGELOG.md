@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0.0-BETA
+
+- [LDEV-6677](https://luceeserver.atlassian.net/browse/LDEV-6677) — first BETA, published to Maven Central and as a GitHub pre-release with the .lex files, tested with the Lucee 9 versions from `LUCEE_TEST_VERSIONS_9`
+
 ## 1.0.0.0-ALPHA
 
 - [LDEV-6677](https://luceeserver.atlassian.net/browse/LDEV-6677) — initial version, the HTTP engine based on Apache HttpClient 5, registered with the manifest attribute `http-engine`
