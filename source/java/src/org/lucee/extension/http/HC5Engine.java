@@ -256,9 +256,29 @@ public final class HC5Engine implements HTTPClientEngine {
 
 	@Override
 	public HTTPResponse execute(HTTPRequest r) throws IOException {
+		// the entry in the debugging output (LDEV-2822), only when debugging is enabled for the request
+		HC5Debug debug = HC5Debug.begin();
+		if (debug == null) return execute(r, null);
+		HTTPResponse response = null;
+		Throwable failure = null;
+		try {
+			response = execute(r, debug);
+			return response;
+		}
+		catch (IOException | RuntimeException e) {
+			failure = e;
+			throw e;
+		}
+		finally {
+			debug.end(response, failure);
+		}
+	}
+
+	private HTTPResponse execute(HTTPRequest r, HC5Debug debug) throws IOException {
 		r.validate();
 		URL url = r.getURL();
 		URI uri = toURI(url);
+		if (debug != null) debug.target(r.getMethod(), url);
 
 		String redirect = r.getRedirect() == null ? "true" : r.getRedirect().trim();
 		boolean follow = !"false".equalsIgnoreCase(redirect);
@@ -371,6 +391,7 @@ public final class HC5Engine implements HTTPClientEngine {
 					throw ce;
 				}
 				reused = reused(context, connections);
+				if (debug != null) debug.exchange(reused);
 				int status = rsp.getCode();
 				org.apache.hc.core5.http.Header loc = rsp.getFirstHeader("Location");
 				String location = loc == null ? null : loc.getValue();
