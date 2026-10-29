@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0.1-BETA
+
+- [LDEV-2542](https://luceeserver.atlassian.net/browse/LDEV-2542) — the result of `cfhttp` has the key `request` with the request that was sent, as with the built-in engine. Lucee builds the key and masks sensitive values, the extension supplies the final URL after the redirects, tests in `tests/HttpRequestKeyTest.cfc` check the key against what the engine sent (they are skipped on a Lucee version without the key)
+
 ## 1.0.0.0-BETA
 
 - [LDEV-6677](https://luceeserver.atlassian.net/browse/LDEV-6677) — first BETA, published to Maven Central and as a GitHub pre-release with the .lex files, tested with the Lucee 9 versions from `LUCEE_TEST_VERSIONS_9`
