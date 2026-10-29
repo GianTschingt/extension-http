@@ -2,6 +2,7 @@
 
 ## 1.0.0.1-BETA
 
+- [LDEV-2822](https://luceeserver.atlassian.net/browse/LDEV-2822) — with debugging enabled every HTTP call has an entry in the section "HTTP" of the debugging output: method, host and path (never the query string or the user info), status code, duration and whether the pooled connection was reused. The entries are added with the generic data of the debugger of Lucee (the same as `DebugAdd()`), there is no entry without debugging. Tests in `tests/HttpDebugTest.cfc`
 - [LDEV-2542](https://luceeserver.atlassian.net/browse/LDEV-2542) — the result of `cfhttp` has the key `request` with the request that was sent, as with the built-in engine. Lucee builds the key and masks sensitive values, the extension supplies the final URL after the redirects, tests in `tests/HttpRequestKeyTest.cfc` check the key against what the engine sent (they are skipped on a Lucee version without the key)
 
 ## 1.0.0.0-BETA
