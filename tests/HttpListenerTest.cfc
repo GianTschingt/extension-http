@@ -129,7 +129,7 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="http" {
 				expect( res.status_code ).toBe( 201 );
 			});
 
-			it( title="after gets the url after the redirect the engine followed", body=function( currentSpec ) {
+			it( title="after gets the arguments of the tag and the result of the redirect the engine followed", body=function( currentSpec ) {
 				var srv = new _RecordingServer( [
 					rsp( 302, "Found", [ "Location: http://127.0.0.1:{port}/target" ], "" ),
 					rsp( 200, "OK", [], "target" )
