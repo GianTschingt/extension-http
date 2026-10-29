@@ -18,6 +18,7 @@ import lucee.commons.io.res.ContentType;
 import lucee.commons.net.http.HTTPResponse;
 import lucee.commons.net.http.Header;
 import lucee.runtime.type.Array;
+import lucee.runtime.type.Struct;
 
 /**
  * response of the HTTP engine based on Apache HttpClient 5
@@ -74,6 +75,7 @@ final class HC5Response implements HTTPResponse {
 	private final URL url;
 	private final URL target;
 	private final List<URI> locations;
+	private final Struct connection;
 	private final Header[] headers;
 	// the content, when it had to be read to get its length
 	private byte[] buffered;
@@ -84,13 +86,15 @@ final class HC5Response implements HTTPResponse {
 	 * @param url the URL of the request
 	 * @param target the URL of the response, after the redirects
 	 * @param locations the URLs of the redirects that were followed
+	 * @param connection the data about the connection of the response, for the result of the tag (LDEV-2675)
 	 */
-	HC5Response(ClassicHttpResponse rsp, CloseableHttpClient client, URL url, URI target, List<URI> locations) throws MalformedURLException {
+	HC5Response(ClassicHttpResponse rsp, CloseableHttpClient client, URL url, URI target, List<URI> locations, Struct connection) throws MalformedURLException {
 		this.rsp = rsp;
 		this.client = client;
 		this.url = url;
 		this.target = target.toURL();
 		this.locations = locations;
+		this.connection = connection;
 
 		// HttpClient decompresses the content (gzip, deflate, ...) and replaces the entity with one that has no
 		// content encoding anymore, only then the headers that describe the compressed content are removed (like
@@ -237,6 +241,14 @@ final class HC5Response implements HTTPResponse {
 	@Override
 	public URL getTargetURL() {
 		return target;
+	}
+
+	/**
+	 * The data about the connection of this response, Lucee adds it as "connection" to the result of the tag
+	 * (LDEV-2675). Not part of the HTTPResponse interface of Lucee versions that do not know it, so no @Override.
+	 */
+	public Struct getConnectionInfo() {
+		return connection;
 	}
 
 	@Override

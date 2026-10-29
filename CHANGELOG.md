@@ -3,6 +3,7 @@
 ## 1.0.0.1-BETA
 
 - [LDEV-2542](https://luceeserver.atlassian.net/browse/LDEV-2542) — the result of `cfhttp` has the key `request` with the request that was sent, as with the built-in engine. Lucee builds the key and masks sensitive values, the extension supplies the final URL after the redirects, tests in `tests/HttpRequestKeyTest.cfc` check the key against what the engine sent (they are skipped on a Lucee version without the key)
+- [LDEV-2675](https://luceeserver.atlassian.net/browse/LDEV-2675) — the result of `cfhttp` has the key `connection`: if the connection of the response was taken from the pool (`reused`), the number of requests it has carried (`requests`) and the stats of the pool for the route (`leased`, `available`, `pending`, `max`). A request with `pooling=false` has `pooled=false` and no pool stats. The extension detects the reuse from the number of requests of the connection and supplies the data with `getConnectionInfo()` of its response, Lucee adds the key. Tests in `tests/HttpConnectionTest.cfc` compare the key with the connections a server has accepted (they need a Lucee version that has LDEV-2675)
 
 ## 1.0.0.0-BETA
 
