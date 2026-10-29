@@ -1,12 +1,41 @@
 name: Java CI Combined
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Publish (a new build number) to Maven Central'
+        type: boolean
+        default: false
+      qualifier:
+        description: 'Qualifier for this run. "pom" keeps extension.version.qualifier from pom.xml (-SNAPSHOT); pick RC, BETA, ALPHA or release (none) to publish a release candidate or final release from the current code'
+        type: choice
+        options: [pom, SNAPSHOT, ALPHA, BETA, RC, release]
+        default: pom
+
+# Run builds of the same ref one after another, so every push to the default branch resolves its own
+# revision (highest build + 1) only after the previous build has published and created its tag.
+# PRs have their own ref (refs/pull/N/merge), so they are not blocked by default branch builds.
+# queue: max keeps up to 100 pending runs (default would keep only one and cancel older pending runs).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   setup:
     runs-on: ubuntu-latest
+    env:
+      # like Lucee core (LDEV-6516): every push to the default branch publishes a new build, a manual run publishes when deploy is ticked.
+      # PRs never publish. Runs without the deploy secrets (forks) only build and test, see "Resolve next revision".
+      DO_DEPLOY: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+      QUALIFIER_INPUT: ${{ inputs.qualifier || 'pom' }}
     outputs:
       version: ${{ steps.extract-version.outputs.VERSION }}
+      tag: ${{ steps.extract-version.outputs.TAG }}
+      deploy: ${{ steps.extract-version.outputs.DEPLOY }}
       lucee-versions: ${{ steps.lucee-versions.outputs.versions }}
     steps:
       - name: Checkout repository
@@ -43,11 +72,85 @@ jobs:
           fi
           echo "versions=$(echo "${LUCEE_TEST_VERSIONS_9}" | jq -c .)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve next revision
+        run: |
+          set -euo pipefail
+          # Only builds that publish allocate a build number: every push to the default branch and manual runs with deploy ticked.
+          # PRs and runs without the deploy secrets (forks) keep the default POM revision (base.0 + qualifier) and publish nothing.
+          if [ "$DO_DEPLOY" != "true" ]; then
+            echo "Skipping revision bump (not a push to the default branch / manual deploy)"
+            exit 0
+          fi
+          # without deploy credentials nothing gets published, so do not consume a build number
+          if [ "${{ secrets.GPG_PASSPHRASE }}" == "" ] || [ "${{ secrets.MAVEN_USERNAME }}" == "" ]; then
+            echo "Skipping revision bump (no GPG / Maven deploy credentials; test-only run)"
+            exit 0
+          fi
+
+          BASE=$(mvn help:evaluate -Dexpression=extension.version.base -q -DforceStdout | tr -d '\r')
+          QUALIFIER=$(mvn help:evaluate -Dexpression=extension.version.qualifier -q -DforceStdout | tr -d '\r')
+          # an empty property evaluates to "null"
+          [ "$QUALIFIER" == "null" ] && QUALIFIER=""
+          # a manual run can publish the current code as ALPHA, BETA, RC or final release instead of the pom qualifier
+          case "$QUALIFIER_INPUT" in
+            pom|"") ;;
+            release) QUALIFIER="" ;;
+            SNAPSHOT|ALPHA|BETA|RC) QUALIFIER="-$QUALIFIER_INPUT" ;;
+            *) echo "::error::unknown qualifier input [$QUALIFIER_INPUT]"; exit 1 ;;
+          esac
+          echo "Base=$BASE qualifier=$QUALIFIER"
+          BASE_RE=$(printf '%s' "$BASE" | sed 's/\./\\./g')
+
+          git fetch --tags --force origin 2>/dev/null || true
+
+          # The artifact ids and group come from the pom: the extension is published as ARTIFACT (project.artifactId) and
+          # as MVN_ARTIFACT (mvnArtifactId, the maven coordinates inside the .lex).
+          GROUP_PATH=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout | tr -d '\r' | tr . /)
+          ARTIFACT=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout | tr -d '\r')
+          MVN_ARTIFACT=$(mvn help:evaluate -Dexpression=mvnArtifactId -q -DforceStdout | tr -d '\r')
+
+          # highest build of this base, from git tags (base.N), Maven Central and the Central snapshot repository (base.N[-QUALIFIER]).
+          # Both are checked, so a version published without a tag is never built twice.
+          BUILDS=$(git tag -l "${BASE}.*" | sed -nE "s/^${BASE_RE}\.([0-9]+)$/\1/p" || true)
+          for url in \
+            "https://repo1.maven.org/maven2/$GROUP_PATH/$ARTIFACT/maven-metadata.xml" \
+            "https://repo1.maven.org/maven2/$GROUP_PATH/$MVN_ARTIFACT/maven-metadata.xml" \
+            "https://central.sonatype.com/repository/maven-snapshots/$GROUP_PATH/$ARTIFACT/maven-metadata.xml" \
+            "https://central.sonatype.com/repository/maven-snapshots/$GROUP_PATH/$MVN_ARTIFACT/maven-metadata.xml"
+          do
+            META=$(curl -fsSL --max-time 30 "$url" 2>/dev/null || true)
+            BUILDS="$BUILDS"$'\n'$(printf '%s' "$META" | grep -oE "<version>${BASE_RE}\.[0-9]+([-.][^<]*)?</version>" | sed -E "s#<version>${BASE_RE}\.([0-9]+).*#\1#" || true)
+          done
+          MAX_BUILD=$(printf '%s\n' "$BUILDS" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
+          if [ -z "$MAX_BUILD" ]; then
+            NEXT_BUILD=0
+          else
+            NEXT_BUILD=$((MAX_BUILD + 1))
+          fi
+
+          VERSION="${BASE}.${NEXT_BUILD}${QUALIFIER}"
+          # tag shape matches existing tags: numeric 4-part without qualifier
+          TAG="${BASE}.${NEXT_BUILD}"
+          echo "Resolved VERSION=$VERSION TAG=$TAG (max seen build=${MAX_BUILD:-none})"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "DEPLOY=true" >> "$GITHUB_ENV"
+
       - name: Extract version number
         id: extract-version
         run: |
-          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ -z "${VERSION:-}" ]; then
+            VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout | tr -d '\r')
+          fi
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){3}(-[A-Za-z0-9]+)*$'; then
+            echo "::error::[$VERSION] is not a valid extension version"; exit 1
+          fi
+          echo "Using VERSION=$VERSION TAG=${TAG:-}"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "TAG=${TAG:-}" >> $GITHUB_OUTPUT
+          echo "DEPLOY=${DEPLOY:-false}" >> $GITHUB_OUTPUT
 
       - name: Cache Lucee files
         uses: actions/cache@v4
@@ -80,12 +183,13 @@ jobs:
 
       - name: Build and Install with Maven (for testing only)
         env:
+          VERSION: ${{ needs.setup.outputs.version }}
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           echo "------- Maven Install (to create a local test build) -------";
-          mvn -B -e -f pom.xml clean install -Dgoal=install
+          mvn -B -e -f pom.xml clean install -Dgoal=install -Drevision="$VERSION"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -150,8 +254,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: [setup, build-and-test]
-    # deploy only from pushes (or manual runs) on the default branch after the tests passed, never for pull requests or other branches
-    if: needs.build-and-test.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # set by the setup job: push to the default branch or manual deploy, with the deploy secrets available
+    if: needs.setup.outputs.deploy == 'true'
+    permissions:
+      # push the tag of the published revision
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -194,41 +301,54 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
           VERSION: ${{ needs.setup.outputs.version }}
         run: |
+          set -euo pipefail
           if [ -z "$VERSION" ]; then
             echo "::error::no version from the setup job"; exit 1
           fi
+          # central-publishing-maven-plugin sends a -SNAPSHOT version to the Central snapshot repository,
+          # any other qualifier (-ALPHA, -BETA, -RC or none) to Maven Central.
+          # Everything is signed, snapshots included.
           if [[ "$VERSION" == *-SNAPSHOT ]]; then
-            echo "------- Maven Deploy snapshot $VERSION -------"
-            mvn -B -e -f pom.xml clean deploy -Dgoal=deploy --settings maven-settings.xml
-          elif [[ "$VERSION" == *-ALPHA ]]; then
-            echo "------- Maven Install alpha $VERSION (ALPHA builds are not published) -------"
-            mvn -B -e -f pom.xml clean install -Dgoal=install --settings maven-settings.xml
+            echo "------- Maven Deploy snapshot $VERSION on ${{ github.event_name }} -------"
           else
-            # final, BETA and RC builds go to Maven Central
-            echo "------- Maven Deploy release $VERSION -------"
-            mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true --settings maven-settings.xml
+            echo "------- Maven Deploy release $VERSION on ${{ github.event_name }} -------"
           fi
+          mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true -Drevision="$VERSION" --settings maven-settings.xml
 
       # LDEV-6677: the published .lex files (full and lite) for the github-release job
       - name: Upload artifact for GitHub release
+        if: success() && !endsWith(needs.setup.outputs.version, '-SNAPSHOT')
         uses: actions/upload-artifact@v4
         with:
           name: http-release
           path: target/*.lex
 
-  # LDEV-6677: publish every final, BETA and RC build as a GitHub release with its .lex files attached,
-  # like the other extensions (LDEV-6511). -SNAPSHOT and ALPHA builds are not published, so they get no GitHub release.
+      - name: Tag published revision
+        if: success() && needs.setup.outputs.tag != ''
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin 2>/dev/null || true
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists - skipping"
+            exit 0
+          fi
+          echo "Creating annotated tag $TAG for $VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$VERSION"
+          git push origin "refs/tags/$TAG"
+
+  # LDEV-6677: publish every final, ALPHA, BETA and RC build as a GitHub release with its .lex files attached,
+  # like the other extensions (LDEV-6511). -SNAPSHOT builds get no GitHub release.
   # Separate job, so a failure here never blocks the Maven Central deploy.
   github-release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [setup, deploy]
-    if: >-
-      needs.deploy.result == 'success'
-      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      && !endsWith(needs.setup.outputs.version, '-SNAPSHOT')
-      && !endsWith(needs.setup.outputs.version, '-ALPHA')
+    if: needs.setup.outputs.deploy == 'true' && !endsWith(needs.setup.outputs.version, '-SNAPSHOT')
     permissions:
       # create the release (and its tag) and upload its assets
       contents: write
@@ -245,6 +365,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.setup.outputs.version }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          IS_DEFAULT_BRANCH: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -254,20 +376,31 @@ jobs:
           fi
           printf 'Asset: %s\n' "${FILES[@]}"
 
-          # the release tag is the exact published version (e.g. 1.0.0.0-BETA), created on this commit
-          # if it does not exist yet. BETA/RC are pre-releases and never "latest".
+          # the release tag is the exact published version. A final release (BASE.N) reuses the build tag the deploy job
+          # pushed, a qualifier version (BASE.N-RC) gets its own tag on the same commit. Qualifier tags do not match
+          # the build number lookup (^BASE\.([0-9]+)$) in "Resolve next revision".
+          # ALPHA/BETA/RC are pre-releases and never "latest".
           if [[ "$VERSION" == *-* ]]; then
             PRE=(--prerelease --latest=false)
-          else
+          elif [ "$IS_DEFAULT_BRANCH" == "true" ]; then
             PRE=(--latest)
+          else
+            PRE=(--latest=false)
+          fi
+
+          if [ "$VERSION" == "$TAG" ]; then
+            TARGET=(--verify-tag)
+          else
+            # creates the tag on this commit if it does not exist yet
+            TARGET=(--target "$GITHUB_SHA")
           fi
 
           if gh release view "$VERSION" >/dev/null 2>&1; then
             echo "Release $VERSION already exists - uploading assets again"
             gh release upload "$VERSION" "${FILES[@]}" --clobber
           else
-            echo "Creating release $VERSION ${PRE[*]} on $GITHUB_SHA"
-            gh release create "$VERSION" "${FILES[@]}" "${PRE[@]}" --target "$GITHUB_SHA" \
+            echo "Creating release $VERSION ${PRE[*]} ${TARGET[*]}"
+            gh release create "$VERSION" "${FILES[@]}" "${PRE[@]}" "${TARGET[@]}" \
               --title "$VERSION" \
               --notes "Build $VERSION from commit $GITHUB_SHA, published by $RUN_URL"
           fi
