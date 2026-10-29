@@ -116,7 +116,7 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="http" {
 						http url="#srv.getBaseUrl()#/first" result="local.res";
 						http url="#srv.getBaseUrl()#/second" result="local.res";
 					});
-					expect( srv.getConnectionCount() ).toBe( 1 );
+					expect( srv.getConnections() ).toBe( 1 );
 				}
 				finally {
 					srv.stop();
@@ -135,7 +135,7 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="http" {
 						http url="#srv.getBaseUrl()#/first" pooling=false result="local.res";
 						http url="#srv.getBaseUrl()#/second" pooling=false result="local.res";
 					});
-					expect( srv.getConnectionCount() ).toBe( 2 );
+					expect( srv.getConnections() ).toBe( 2 );
 				}
 				finally {
 					srv.stop();

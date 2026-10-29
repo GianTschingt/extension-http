@@ -14,6 +14,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,6 +25,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLContext;
 
 import org.apache.hc.client5.http.HttpRoute;
+import org.apache.hc.client5.http.RouteInfo;
 import org.apache.hc.client5.http.auth.AuthSchemeFactory;
 import org.apache.hc.client5.http.auth.AuthScope;
 import org.apache.hc.client5.http.auth.StandardAuthScheme;
@@ -55,6 +57,7 @@ import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.EndpointDetails;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.HttpRequest;
@@ -348,8 +351,9 @@ public final class HC5Engine implements HTTPClientEngine {
 		// connection of its own, they are closed with the response
 		CloseableHttpClient client;
 		CloseableHttpClient ownClient = null;
+		Pool pool = null;
 		if (r.isPooling()) {
-			client = pool(r).client;
+			client = (pool = pool(r)).client;
 		}
 		else {
 			client = ownClient = createPool(r, 1, 1).client;
@@ -359,6 +363,10 @@ public final class HC5Engine implements HTTPClientEngine {
 		HttpEntity entity = createEntity(r, method);
 		List<URI> locations = new ArrayList<>();
 		AtomicReference<HttpUriRequestBase> current = new AtomicReference<>();
+		// the connections this call has seen (local address + remote address), and if they were already used by an
+		// earlier call (LDEV-2675)
+		Map<String, Boolean> connections = new HashMap<>();
+		Boolean reused = null;
 		r.setAbortHandler(() -> {
 			HttpUriRequestBase req = current.get();
 			if (req != null) req.cancel();
@@ -382,7 +390,8 @@ public final class HC5Engine implements HTTPClientEngine {
 					ce.initCause(e);
 					throw ce;
 				}
-				if (debug != null) debug.exchange(context);
+				reused = reused(context, connections);
+				if (debug != null) debug.exchange(reused);
 				int status = rsp.getCode();
 				org.apache.hc.core5.http.Header loc = rsp.getFirstHeader("Location");
 				String location = loc == null ? null : loc.getValue();
@@ -412,7 +421,7 @@ public final class HC5Engine implements HTTPClientEngine {
 					continue;
 				}
 				try {
-					return new HC5Response(rsp, ownClient, url, uri, locations);
+					return new HC5Response(rsp, ownClient, url, uri, locations, connectionInfo(pool, context, reused));
 				}
 				catch (IOException | RuntimeException e) {
 					rsp.close();
@@ -424,6 +433,51 @@ public final class HC5Engine implements HTTPClientEngine {
 			if (ownClient != null) ownClient.close();
 			throw e;
 		}
+	}
+
+	/**
+	 * Was the connection that carried the last exchange already used by an earlier call (LDEV-2675)?
+	 * 
+	 * The number of requests the connection has carried is the reliable source: a new connection has carried exactly
+	 * one request (the one that is answered), a connection from the pool more. A redirect can use the connection
+	 * of the previous exchange of the same call, that is not a reuse from the pool, so a connection keeps the answer
+	 * of its first exchange in this call.
+	 * 
+	 * @return null when the connection is not known
+	 */
+	private static Boolean reused(HttpClientContext context, Map<String, Boolean> connections) {
+		EndpointDetails ed = context.getEndpointDetails();
+		if (ed == null) return null;
+		String key = ed.getLocalAddress() + ">" + ed.getRemoteAddress();
+		Boolean reused = connections.get(key);
+		if (reused == null) {
+			reused = ed.getRequestCount() > 1;
+			connections.put(key, reused);
+		}
+		return reused;
+	}
+
+	/**
+	 * The connection data for the result of the tag (LDEV-2675), a snapshot taken when the response arrived. With
+	 * pooling the stats of the pool for the route of the request, without pooling the request had a connection of
+	 * its own, that is closed with the response, so there are no pool stats.
+	 */
+	private static Struct connectionInfo(Pool pool, HttpClientContext context, Boolean reused) {
+		Struct sct = Util.engine().getCreationUtil().createStruct();
+		sct.setEL("pooled", pool != null);
+		sct.setEL("reused", reused != null && reused);
+		EndpointDetails ed = context.getEndpointDetails();
+		if (ed != null) sct.setEL("requests", ed.getRequestCount());
+		RouteInfo route = context.getHttpRoute();
+		if (route != null) sct.setEL("route", route.getTargetHost().toHostString());
+		if (pool != null && route instanceof HttpRoute) {
+			PoolStats stats = pool.manager.getStats((HttpRoute) route);
+			sct.setEL("leased", stats.getLeased());
+			sct.setEL("available", stats.getAvailable());
+			sct.setEL("pending", stats.getPending());
+			sct.setEL("max", stats.getMax());
+		}
+		return sct;
 	}
 
 	@SuppressWarnings("deprecation")

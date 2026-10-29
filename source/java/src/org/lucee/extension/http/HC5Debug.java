@@ -5,9 +5,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.hc.client5.http.protocol.HttpClientContext;
-import org.apache.hc.core5.http.EndpointDetails;
-
 import lucee.commons.net.http.HTTPResponse;
 import lucee.runtime.PageContext;
 import lucee.runtime.debug.Debugger;
@@ -68,14 +65,13 @@ final class HC5Debug {
 	/**
 	 * an exchange with the server is done (a response or an error of the server is there), the redirects
 	 * of a call are more than one
+	 * 
+	 * @param reused if the connection of the exchange came from the pool, null when it is not known
 	 */
-	void exchange(HttpClientContext context) {
-		EndpointDetails details = context.getEndpointDetails();
-		// without the details it is not known
-		if (details == null) return;
+	void exchange(Boolean reused) {
+		if (reused == null) return;
 		exchanged = true;
-		// the first request of a connection is the request count 1
-		if (details.getRequestCount() <= 1) reused = false;
+		if (!reused) this.reused = false;
 	}
 
 	/**
