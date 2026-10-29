@@ -55,22 +55,33 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # the Lucee versions to test with come only from the variable LUCEE_TEST_VERSIONS_9 (organization or repository),
-      # there is no fallback version in this file, without the variable the build fails here with a clear message
+      # Repository and organization variables are not passed to pull_request runs from forks, so
+      # vars.LUCEE_TEST_VERSIONS_9 is empty there and the matrix would be empty. Use the variable when it is set,
+      # otherwise test the latest build of the Lucee line on Maven Central (the Lucee 9 alphas are not on
+      # update.lucee.org / the CDN, the test jar comes from Maven Central), so fork PRs are tested too.
       - name: Lucee versions to test with
         id: lucee-versions
         env:
-          LUCEE_TEST_VERSIONS_9: ${{ vars.LUCEE_TEST_VERSIONS_9 }}
+          TEST_VERSIONS: ${{ vars.LUCEE_TEST_VERSIONS_9 }}
+          FALLBACK_LINE: "9.0"
         run: |
-          if [ -z "${LUCEE_TEST_VERSIONS_9}" ]; then
-            echo "::error::the variable LUCEE_TEST_VERSIONS_9 is not set, set it (organization or repository) to the Lucee versions to test with, e.g. [{\"version\":\"<Lucee 9 version>\",\"branch\":\"9.0\"}]"
-            exit 1
+          set -euo pipefail
+          if [[ -n "${TEST_VERSIONS// }" ]] && echo "$TEST_VERSIONS" | jq -e 'type == "array" and length > 0 and all(.[]; (.version | type == "string" and length > 0) and (.branch | type == "string" and length > 0))' > /dev/null; then
+            echo "Using vars.LUCEE_TEST_VERSIONS_9"
+            MATRIX=$(echo "$TEST_VERSIONS" | jq -c '.')
+          else
+            echo "::notice::vars.LUCEE_TEST_VERSIONS_9 is not available or not a JSON array of {version, branch} (fork pull request?), testing the latest ${FALLBACK_LINE} build on Maven Central"
+            META=$(curl -fsSL --retry 3 https://repo1.maven.org/maven2/org/lucee/lucee/maven-metadata.xml)
+            LATEST=$(printf '%s' "$META" | grep -oE "<version>${FALLBACK_LINE//./\\.}(\.[0-9]+)+(-[A-Za-z0-9]+)*</version>" | sed -E 's#</?version>##g' | sort -V | tail -1 || true)
+            if [ -z "$LATEST" ]; then
+              echo "::error::no ${FALLBACK_LINE} version of org.lucee:lucee found on Maven Central"
+              exit 1
+            fi
+            echo "Latest ${FALLBACK_LINE} build: ${LATEST}"
+            MATRIX=$(jq -c -n --arg v "$LATEST" --arg b "$FALLBACK_LINE" '[{version: $v, branch: $b}]')
           fi
-          if ! echo "${LUCEE_TEST_VERSIONS_9}" | jq -e 'type == "array" and length > 0 and all(.[]; (.version | type == "string" and length > 0) and (.branch | type == "string" and length > 0))' > /dev/null; then
-            echo "::error::the variable LUCEE_TEST_VERSIONS_9 must be a non empty JSON array of {\"version\":...,\"branch\":...}, it is: ${LUCEE_TEST_VERSIONS_9}"
-            exit 1
-          fi
-          echo "versions=$(echo "${LUCEE_TEST_VERSIONS_9}" | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "Lucee test matrix: ${MATRIX}"
+          echo "versions=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve next revision
         run: |
@@ -207,7 +218,7 @@ jobs:
           ref: ${{ matrix.lucee.branch }}
 
       # Lucee 9 alphas are not on update.lucee.org / the CDN, so fetch the light jar from Maven Central
-      # (the version comes from the LUCEE_TEST_VERSIONS_9 matrix entry)
+      # (the version comes from the Lucee test matrix: LUCEE_TEST_VERSIONS_9, or the latest 9.0 build when it is not available)
       - name: Download Lucee light jar from Maven Central
         id: lucee-jar
         env:
