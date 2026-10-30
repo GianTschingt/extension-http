@@ -102,17 +102,29 @@ jobs:
           path: lucee
           ref: ${{ matrix.lucee.branch }}
 
-      # Lucee 9 alphas are not on update.lucee.org / the CDN, so fetch the light jar from Maven Central
+      # Lucee 9 alphas are not on update.lucee.org / the CDN, so fetch the light jar from Maven Central,
+      # falling back to the Maven repository in the variable LUCEE_MAVEN_URL (the Lucee builds that are not released to Central)
       # (the version comes from the LUCEE_TEST_VERSIONS_9 matrix entry)
-      - name: Download Lucee light jar from Maven Central
+      - name: Download Lucee light jar from Maven Central or the Lucee Maven repository
         id: lucee-jar
         env:
           LUCEE_VERSION: ${{ matrix.lucee.version }}
+          LUCEE_MAVEN_URL: ${{ vars.LUCEE_MAVEN_URL }}
         run: |
           JAR="${{ runner.temp }}/lucee-light-${LUCEE_VERSION}.jar"
-          URL="https://repo1.maven.org/maven2/org/lucee/lucee/${LUCEE_VERSION}/lucee-${LUCEE_VERSION}-light.jar"
+          MAVEN_PATH="org/lucee/lucee/${LUCEE_VERSION}/lucee-${LUCEE_VERSION}-light.jar"
+          URL="https://repo1.maven.org/maven2/${MAVEN_PATH}"
           echo "Downloading ${URL}"
-          curl -fsSL --retry 3 -o "${JAR}" "${URL}"
+          if ! curl -fsSL --retry 3 -o "${JAR}" "${URL}"; then
+            rm -f "${JAR}"
+            if [ -z "${LUCEE_MAVEN_URL}" ]; then
+              echo "::error::${LUCEE_VERSION} is not on Maven Central and the variable LUCEE_MAVEN_URL is not set"
+              exit 1
+            fi
+            URL="${LUCEE_MAVEN_URL%/}/${MAVEN_PATH}"
+            echo "Not on Maven Central, downloading ${URL}"
+            curl -fsSL --retry 3 -o "${JAR}" "${URL}"
+          fi
           echo "path=${JAR}" >> "$GITHUB_OUTPUT"
 
       # the cfhttp tests of Lucee (label http) and the tests of this extension (tests/) run with the extension installed,
